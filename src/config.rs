@@ -105,6 +105,13 @@ pub struct Config {
 
     /// If enable, followers will not forward proposal to leader.
     pub disable_proposal_forwarding: bool,
+
+    /// Limit the maximum size of a snapshot chunk. A snapshot larger than this
+    /// value is transferred in multiple `MsgSnapshot` messages so an
+    /// interrupted transfer can resume from the receiver's confirmed offset.
+    ///
+    /// Zero disables chunking.
+    pub max_snapshot_chunk_size: u64,
 }
 
 impl Default for Config {
@@ -129,6 +136,7 @@ impl Default for Config {
             max_committed_size_per_ready: NO_LIMIT,
             max_apply_unpersisted_log_limit: 0,
             disable_proposal_forwarding: false,
+            max_snapshot_chunk_size: 1024 * 1024,
         }
     }
 }

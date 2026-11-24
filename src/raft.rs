@@ -19,7 +19,7 @@ use std::ops::{Deref, DerefMut};
 
 use crate::eraftpb::{
     ConfChange, ConfChangeV2, ConfState, Entry, EntryType, HardState, Message, MessageType,
-    Snapshot,
+    Snapshot, SnapshotMetadata,
 };
 use raft_proto::protocompat::*;
 use raft_proto::ConfChangeI;
@@ -256,6 +256,20 @@ pub struct RaftCore<T: Storage> {
 
     /// Max size per committed entries in a `Read`.
     pub(crate) max_committed_size_per_ready: u64,
+
+    /// Max size of a snapshot chunk.
+    max_snapshot_chunk_size: u64,
+
+    /// A partially received chunked snapshot.
+    snapshot_receiver: Option<SnapshotReceiver>,
+}
+
+struct SnapshotReceiver {
+    index: u64,
+    term: u64,
+    size: u64,
+    metadata: SnapshotMetadata,
+    data: Vec<u8>,
 }
 
 /// A struct that represents the raft consensus itself. Stores details concerning the current
@@ -365,6 +379,8 @@ impl<T: Storage> Raft<T> {
                 },
                 max_committed_size_per_ready: c.max_committed_size_per_ready,
                 disable_proposal_forwarding: c.disable_proposal_forwarding,
+                max_snapshot_chunk_size: c.max_snapshot_chunk_size,
+                snapshot_receiver: None,
             },
         };
         confchange::restore(&mut r.prs, r.r.raft_log.last_index(), conf_state)?;
@@ -705,18 +721,53 @@ impl<T: Storage> RaftCore<T> {
             fatal!(self.logger, "need non-empty snapshot");
         }
         let (sindex, sterm) = (snapshot.get_metadata().index, snapshot.get_metadata().term);
-        m.set_snapshot(snapshot);
+        let total_size = snapshot.get_data().len() as u64;
+        let chunk_size = if self.max_msg_size == 0 {
+            self.max_snapshot_chunk_size
+        } else {
+            self.max_snapshot_chunk_size.min(self.max_msg_size)
+        };
+        let offset = if chunk_size == 0 || total_size == 0 {
+            pr.become_snapshot(sindex);
+            m.snapshot_offset = 0;
+            m.snapshot_size = 0;
+            m.set_snapshot(snapshot);
+            0
+        } else {
+            let mut offset = if pr.pending_snapshot_index == sindex
+                && pr.pending_snapshot_term == sterm
+                && pr.pending_snapshot_size == total_size
+            {
+                pr.pending_snapshot_offset.min(total_size)
+            } else {
+                0
+            };
+            if offset > total_size {
+                offset = 0;
+            }
+            let end = offset.saturating_add(chunk_size).min(total_size);
+            let mut chunk = snapshot;
+            chunk.data = chunk.get_data()[offset as usize..end as usize]
+                .to_vec()
+                .into();
+            m.snapshot_offset = offset;
+            m.snapshot_size = total_size;
+            m.set_snapshot(chunk);
+            pr.become_snapshot_transfer(sindex, sterm, total_size);
+            offset
+        };
         debug!(
             self.logger,
-            "[firstindex: {first_index}, commit: {committed}] sent snapshot[index: {snapshot_index}, term: {snapshot_term}] to {to}",
+            "[firstindex: {first_index}, commit: {committed}] sent snapshot[index: {snapshot_index}, term: {snapshot_term}, offset: {offset}, size: {total_size}] to {to}",
             first_index = self.raft_log.first_index(),
             committed = self.raft_log.committed,
             snapshot_index = sindex,
             snapshot_term = sterm,
+            offset = offset,
+            total_size = total_size,
             to = to;
             "progress" => ?pr,
         );
-        pr.become_snapshot(sindex);
         debug!(
             self.logger,
             "paused sending replication messages to {}",
@@ -741,6 +792,14 @@ impl<T: Storage> RaftCore<T> {
         if !m.entries.is_empty() {
             let last = m.entries.last().unwrap().index;
             pr.update_state(last);
+        }
+    }
+
+    fn send_snapshot(&mut self, to: u64, pr: &mut Progress, msgs: &mut Vec<Message>) {
+        let mut m = Message::default();
+        m.to = to;
+        if self.prepare_send_snapshot(&mut m, pr, to) {
+            self.send(m, msgs);
         }
     }
 
@@ -1022,6 +1081,7 @@ impl<T: Storage> Raft<T> {
         self.pending_conf_index = 0;
         self.read_only = ReadOnly::new(self.read_only.option);
         self.pending_request_snapshot = INVALID_INDEX;
+        self.snapshot_receiver = None;
 
         let last_index = self.raft_log.last_index();
         let committed = self.raft_log.committed;
@@ -1886,7 +1946,10 @@ impl<T: Storage> Raft<T> {
             pr.ins.free_first_one();
         }
         // Does it request snapshot?
-        if pr.matched < self.r.raft_log.last_index() || pr.pending_request_snapshot != INVALID_INDEX
+        if pr.state == ProgressState::Snapshot && pr.pending_snapshot_size > 0 {
+            self.r.send_snapshot(m.from, pr, &mut self.msgs);
+        } else if pr.matched < self.r.raft_log.last_index()
+            || pr.pending_request_snapshot != INVALID_INDEX
         {
             self.r.send_append(m.from, pr, &mut self.msgs);
         }
@@ -2015,6 +2078,61 @@ impl<T: Storage> Raft<T> {
         // If snapshot failure, wait for a heartbeat interval before next try
         pr.pause();
         pr.pending_request_snapshot = INVALID_INDEX;
+    }
+
+    fn handle_snapshot_ack(&mut self, m: &Message) {
+        let metadata = m.get_snapshot().get_metadata();
+        let complete = {
+            let pr = match self.prs.get_mut(m.from) {
+                Some(pr) => pr,
+                None => return,
+            };
+            if pr.state != ProgressState::Snapshot {
+                return;
+            }
+            if pr.pending_snapshot_size == 0 {
+                return;
+            }
+            if metadata.index != pr.pending_snapshot_index
+                || metadata.term != pr.pending_snapshot_term
+            {
+                return;
+            }
+
+            pr.recent_active = true;
+            let total_size = pr.pending_snapshot_size;
+            let ack_offset = m.snapshot_offset.min(total_size);
+            if m.reject {
+                pr.pending_snapshot_offset = ack_offset;
+            } else if ack_offset < pr.pending_snapshot_offset {
+                // A late acknowledgement from a chunk that was sent before a
+                // rewind must not move the transfer backwards.
+                return;
+            } else {
+                pr.pending_snapshot_offset = ack_offset;
+            }
+            !m.reject && total_size > 0 && ack_offset == total_size
+        };
+
+        if complete {
+            debug!(
+                self.r.logger,
+                "snapshot transfer completed";
+                "from" => m.from,
+                "snapshot_index" => metadata.index,
+                "snapshot_term" => metadata.term,
+            );
+            if let Some(pr) = self.prs.get_mut(m.from) {
+                pr.become_probe();
+                pr.pause();
+                pr.pending_request_snapshot = INVALID_INDEX;
+            }
+            return;
+        }
+
+        if let Some(pr) = self.prs.get_mut(m.from) {
+            self.r.send_snapshot(m.from, pr, &mut self.msgs);
+        }
     }
 
     fn handle_unreachable(&mut self, m: &Message) {
@@ -2194,6 +2312,9 @@ impl<T: Storage> Raft<T> {
             }
             MessageType::MsgSnapStatus => {
                 self.handle_snapshot_status(&m);
+            }
+            MessageType::MsgSnapshotAck => {
+                self.handle_snapshot_ack(&m);
             }
             MessageType::MsgUnreachable => {
                 self.handle_unreachable(&m);
@@ -2573,10 +2694,116 @@ impl<T: Storage> Raft<T> {
         self.r.send(to_send, &mut self.msgs);
     }
 
+    fn send_snapshot_ack(
+        &mut self,
+        to: u64,
+        metadata: SnapshotMetadata,
+        offset: u64,
+        size: u64,
+        reject: bool,
+    ) {
+        let mut snapshot = Snapshot::default();
+        snapshot.set_metadata(metadata);
+        let mut ack = Message::default();
+        ack.set_msg_type(MessageType::MsgSnapshotAck);
+        ack.to = to;
+        ack.snapshot_offset = offset;
+        ack.snapshot_size = size;
+        ack.reject = reject;
+        ack.set_snapshot(snapshot);
+        self.r.send(ack, &mut self.msgs);
+    }
+
     fn handle_snapshot(&mut self, mut m: Message) {
-        let metadata = m.get_snapshot().get_metadata();
+        let total_size = m.snapshot_size;
+        let offset = m.snapshot_offset;
+        let snapshot = m.take_snapshot();
+        let metadata = snapshot.get_metadata().clone();
         let (sindex, sterm) = (metadata.index, metadata.term);
-        if self.restore(m.take_snapshot()) {
+
+        if total_size == 0 {
+            self.r.snapshot_receiver = None;
+            self.handle_complete_snapshot(m.from, snapshot, sindex, sterm);
+            return;
+        }
+
+        let mut reject = false;
+        let mut complete = false;
+        let mut next_offset = 0;
+        let existing = self
+            .r
+            .snapshot_receiver
+            .take()
+            .filter(|r| r.index == sindex && r.term == sterm && r.size == total_size);
+        let mut receiver = None;
+
+        if let Some(mut current) = existing {
+            let received = current.data.len() as u64;
+            if offset < received {
+                // A retransmitted chunk is already part of the prefix.
+                next_offset = received;
+                receiver = Some(current);
+            } else if offset > received {
+                // There is a hole before this chunk. The receiver cannot use
+                // it and must ask the sender to restart from the beginning.
+                reject = true;
+            } else {
+                current.data.extend_from_slice(snapshot.get_data());
+                let received = current.data.len() as u64;
+                if received > total_size {
+                    reject = true;
+                } else if received == total_size {
+                    next_offset = received;
+                    complete = true;
+                } else {
+                    next_offset = received;
+                }
+                if !reject {
+                    receiver = Some(current);
+                }
+            }
+        } else if offset == 0 {
+            let mut new_receiver = SnapshotReceiver {
+                index: sindex,
+                term: sterm,
+                size: total_size,
+                metadata: metadata.clone(),
+                data: Vec::new(),
+            };
+            new_receiver.data.extend_from_slice(snapshot.get_data());
+            let received = new_receiver.data.len() as u64;
+            if received > total_size {
+                reject = true;
+            } else if received == total_size {
+                next_offset = received;
+                complete = true;
+            } else {
+                next_offset = received;
+            }
+            if !reject {
+                receiver = Some(new_receiver);
+            }
+        } else {
+            // Never assume the earlier chunks survived. Ask for offset zero.
+            reject = true;
+        }
+
+        if complete {
+            let receiver = receiver.expect("completed snapshot receiver");
+            let ack_metadata = receiver.metadata.clone();
+            let mut snapshot = Snapshot::default();
+            snapshot.set_metadata(receiver.metadata);
+            snapshot.data = receiver.data.into();
+            self.handle_complete_snapshot(m.from, snapshot, sindex, sterm);
+            self.send_snapshot_ack(m.from, ack_metadata, total_size, total_size, false);
+        } else {
+            self.r.snapshot_receiver = receiver;
+            self.send_snapshot_ack(m.from, metadata, next_offset, total_size, reject);
+        }
+    }
+
+    fn handle_complete_snapshot(&mut self, from: u64, snapshot: Snapshot, sindex: u64, sterm: u64) {
+        if self.restore(snapshot) {
             info!(
                 self.logger,
                 "[commit: {commit}, term: {term}] restored snapshot [index: {snapshot_index}, term: {snapshot_term}]",
@@ -2587,7 +2814,7 @@ impl<T: Storage> Raft<T> {
             );
             let mut to_send = Message::default();
             to_send.set_msg_type(MessageType::MsgAppendResponse);
-            to_send.to = m.from;
+            to_send.to = from;
             to_send.index = self.raft_log.last_index();
             self.r.send(to_send, &mut self.msgs);
         } else {
@@ -2600,7 +2827,7 @@ impl<T: Storage> Raft<T> {
             );
             let mut to_send = Message::default();
             to_send.set_msg_type(MessageType::MsgAppendResponse);
-            to_send.to = m.from;
+            to_send.to = from;
             to_send.index = self.raft_log.committed;
             self.r.send(to_send, &mut self.msgs);
         }

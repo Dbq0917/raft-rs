@@ -66,6 +66,7 @@ enum MessageType {
     MsgReadIndexResp = 16;
     MsgRequestPreVote = 17;
     MsgRequestPreVoteResponse = 18;
+    MsgSnapshotAck = 19;
 }
 
 message Message {
@@ -95,6 +96,14 @@ message Message {
     // compatible change, but it makes minimal impact that only new priority
     // is not recognized by the old nodes during rolling update.
     int64 priority = 16;
+
+    // The byte offset of this snapshot chunk. It is only meaningful when
+    // snapshot_size is greater than zero. A snapshot with an offset of zero
+    // and a size of zero is a complete, non-chunked snapshot.
+    uint64 snapshot_offset = 17;
+    // The total size in bytes of the chunked snapshot. Zero means snapshot
+    // chunking is not in use.
+    uint64 snapshot_size = 18;
 }
 
 message HardState {
