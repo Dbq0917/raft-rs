@@ -29,6 +29,15 @@ pub struct Progress {
     /// this Progress will be paused. raft will not resend snapshot until the pending one
     /// is reported to be failed.
     pub pending_snapshot: u64,
+    /// The term of the pending snapshot.
+    pub pending_snapshot_term: u64,
+    /// The index of the snapshot being transferred. It is retained after a
+    /// failed transfer so the next attempt can resume it.
+    pub pending_snapshot_index: u64,
+    /// The receiver's confirmed byte offset of the pending snapshot.
+    pub pending_snapshot_offset: u64,
+    /// The total byte size of the pending snapshot.
+    pub pending_snapshot_size: u64,
     /// This field is used in request snapshot.
     /// If there is a pending request snapshot, this will be set to the request
     /// index of the snapshot.
@@ -64,6 +73,10 @@ impl Progress {
             state: ProgressState::default(),
             paused: false,
             pending_snapshot: 0,
+            pending_snapshot_term: 0,
+            pending_snapshot_index: 0,
+            pending_snapshot_offset: 0,
+            pending_snapshot_size: 0,
             pending_request_snapshot: 0,
             recent_active: false,
             ins: Inflights::new(ins_size),
@@ -85,6 +98,10 @@ impl Progress {
         self.state = ProgressState::default();
         self.paused = false;
         self.pending_snapshot = 0;
+        self.pending_snapshot_term = 0;
+        self.pending_snapshot_index = 0;
+        self.pending_snapshot_offset = 0;
+        self.pending_snapshot_size = 0;
         self.pending_request_snapshot = INVALID_INDEX;
         self.recent_active = false;
         self.ins.reset();
@@ -99,8 +116,12 @@ impl Progress {
             let pending_snapshot = self.pending_snapshot;
             self.reset_state(ProgressState::Probe);
             self.next_idx = cmp::max(self.matched + 1, pending_snapshot + 1);
+            if pending_snapshot > 0 {
+                self.clear_pending_snapshot_transfer();
+            }
         } else {
             self.reset_state(ProgressState::Probe);
+            self.clear_pending_snapshot_transfer();
             self.next_idx = self.matched + 1;
         }
     }
@@ -109,6 +130,7 @@ impl Progress {
     #[inline]
     pub fn become_replicate(&mut self) {
         self.reset_state(ProgressState::Replicate);
+        self.clear_pending_snapshot_transfer();
         self.next_idx = self.matched + 1;
     }
 
@@ -116,13 +138,46 @@ impl Progress {
     #[inline]
     pub fn become_snapshot(&mut self, snapshot_idx: u64) {
         self.reset_state(ProgressState::Snapshot);
+        self.clear_pending_snapshot_transfer();
         self.pending_snapshot = snapshot_idx;
+        self.pending_snapshot_index = snapshot_idx;
+    }
+
+    /// Changes the progress to a snapshot transfer, preserving the receiver's
+    /// confirmed offset when the snapshot identity is unchanged.
+    pub(crate) fn become_snapshot_transfer(
+        &mut self,
+        snapshot_idx: u64,
+        snapshot_term: u64,
+        snapshot_size: u64,
+    ) {
+        if self.pending_snapshot_index != snapshot_idx
+            || self.pending_snapshot_term != snapshot_term
+            || self.pending_snapshot_size != snapshot_size
+        {
+            self.pending_snapshot_offset = 0;
+        }
+        self.reset_state(ProgressState::Snapshot);
+        self.pending_snapshot = snapshot_idx;
+        self.pending_snapshot_index = snapshot_idx;
+        self.pending_snapshot_term = snapshot_term;
+        self.pending_snapshot_size = snapshot_size;
+        self.pending_snapshot_offset = self.pending_snapshot_offset.min(snapshot_size);
     }
 
     /// Sets the snapshot to failure.
     #[inline]
     pub fn snapshot_failure(&mut self) {
         self.pending_snapshot = 0;
+    }
+
+    /// Clears all state for the snapshot transfer.
+    #[inline]
+    pub(crate) fn clear_pending_snapshot_transfer(&mut self) {
+        self.pending_snapshot_term = 0;
+        self.pending_snapshot_index = 0;
+        self.pending_snapshot_offset = 0;
+        self.pending_snapshot_size = 0;
     }
 
     /// Returns true if Match is equal or higher than the pendingSnapshot.

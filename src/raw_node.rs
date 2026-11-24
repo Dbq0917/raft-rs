@@ -78,6 +78,7 @@ fn is_response_msg(t: MessageType) -> bool {
             | MessageType::MsgHeartbeatResponse
             | MessageType::MsgUnreachable
             | MessageType::MsgRequestPreVoteResponse
+            | MessageType::MsgSnapshotAck
     )
 }
 
@@ -832,6 +833,7 @@ mod test {
             (MessageType::MsgReadIndexResp, false),
             (MessageType::MsgRequestPreVote, false),
             (MessageType::MsgRequestPreVoteResponse, false),
+            (MessageType::MsgSnapshotAck, false),
         ];
         for (msg_type, result) in tests {
             assert_eq!(is_local_msg(msg_type), result);
