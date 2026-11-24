@@ -652,6 +652,85 @@ fn test_leader_election_overwrite_newer_logs_with_config(pre_vote: bool, l: &Log
 }
 
 #[test]
+fn test_stale_candidate_cannot_overwrite_committed() {
+    let l = default_logger();
+    test_stale_candidate_cannot_overwrite_committed_with_config(false, &l);
+}
+
+#[test]
+fn test_stale_candidate_cannot_overwrite_committed_pre_vote() {
+    let l = default_logger();
+    test_stale_candidate_cannot_overwrite_committed_with_config(true, &l);
+}
+
+// A candidate whose log is behind a quorum member must not be elected, so
+// committed entries are never overwritten by a stale leader. Repeated stale
+// campaigns must not prevent an up-to-date node from completing an election.
+fn test_stale_candidate_cannot_overwrite_committed_with_config(pre_vote: bool, l: &Logger) {
+    let peers = vec![1, 2, 3, 4, 5];
+    // Nodes 1, 2 and 3 hold entries (term 1, index 1) and (term 2,
+    // index 2), both committed on the quorum. Nodes 4 and 5 fell
+    // behind on a flaky network and only have the first entry.
+    let node_with_log = |id: u64, terms: &[u64], commit: u64| {
+        let store = MemStorage::new_with_conf_state((peers.clone(), vec![]));
+        for (i, term) in terms.iter().enumerate() {
+            store
+                .wl()
+                .append(&[empty_entry(*term, i as u64 + 1)])
+                .unwrap();
+        }
+        {
+            let mut wl = store.wl();
+            let hs = wl.mut_hard_state();
+            hs.commit = commit;
+            hs.term = *terms.last().unwrap();
+        }
+        new_test_raft_with_prevote(id, peers.clone(), 5, 1, store, pre_vote, l)
+    };
+    let mut config = Network::default_config();
+    config.pre_vote = pre_vote;
+    let mut network = Network::new_with_config(
+        vec![
+            Some(node_with_log(1, &[1, 2], 2)),
+            Some(node_with_log(2, &[1, 2], 2)),
+            Some(node_with_log(3, &[1, 2], 2)),
+            Some(node_with_log(4, &[1], 1)),
+            Some(node_with_log(5, &[1], 1)),
+        ],
+        &config,
+        l,
+    );
+
+    // Repeat the stale campaign to model delayed/replayed election messages.
+    // Nodes 1, 2 and 3 reject it because their logs are newer, so node 5 can
+    // never collect a quorum.
+    for _ in 0..3 {
+        network.send(vec![new_message(5, 5, MessageType::MsgHup, 0)]);
+        assert_ne!(network.peers[&5].state, StateRole::Leader);
+    }
+
+    // Committed entries on the quorum are untouched.
+    for id in 1..=3 {
+        let sm = &network.peers[&id];
+        assert_eq!(sm.raft_log.committed, 2, "node {}: committed", id);
+        let terms: Vec<u64> = sm.raft_log.all_entries().iter().map(|e| e.term).collect();
+        assert_eq!(terms, vec![1, 2], "node {}: entries", id);
+    }
+
+    // An up-to-date node still wins the election, and the committed
+    // entries survive on every node, including the previously stale
+    // ones.
+    network.send(vec![new_message(2, 2, MessageType::MsgHup, 0)]);
+    assert_eq!(network.peers[&2].state, StateRole::Leader);
+    for (id, sm) in &network.peers {
+        let entries = sm.raft_log.all_entries();
+        assert_eq!(entries.len(), 3, "node {}: entries.len()", id);
+        assert_eq!(entries[0].term, 1, "node {}: term at index 1", id);
+        assert_eq!(entries[1].term, 2, "node {}: term at index 2", id);
+    }
+}
+
+#[test]
 fn test_vote_from_any_state() {
     let l = default_logger();
     test_vote_from_any_state_for_type(MessageType::MsgRequestVote, &l);
